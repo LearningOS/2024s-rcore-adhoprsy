@@ -363,7 +363,7 @@ impl MapArea {
                 self.data_frames.insert(vpn, frame);
             }
         }
-        let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
+        let pte_flags = PTEFlags::from_bits(self.map_perm.bits()).unwrap();
         page_table.map(vpn, ppn, pte_flags);
     }
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -428,6 +428,7 @@ pub enum MapType {
 }
 
 bitflags! {
+    #[derive(Clone, Copy)]
     /// map permission corresponding to that in pte: `R W X U`
     pub struct MapPermission: u8 {
         ///Readable
