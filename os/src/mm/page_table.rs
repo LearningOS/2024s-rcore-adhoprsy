@@ -31,7 +31,7 @@ impl PageTableEntry {
     /// Create a new page table entry
     pub fn new(ppn: PhysPageNum, flags: PTEFlags) -> Self {
         PageTableEntry {
-            bits: ppn.0 << 10 | flags.bits as usize,
+            bits: ppn.0 << 10 | flags.bits() as usize,
         }
     }
     /// Create an empty page table entry
@@ -48,19 +48,19 @@ impl PageTableEntry {
     }
     /// The page pointered by page table entry is valid?
     pub fn is_valid(&self) -> bool {
-        (self.flags() & PTEFlags::V) != PTEFlags::empty()
+        !((self.flags() & PTEFlags::V).is_empty())
     }
     /// The page pointered by page table entry is readable?
     pub fn readable(&self) -> bool {
-        (self.flags() & PTEFlags::R) != PTEFlags::empty()
+        !((self.flags() & PTEFlags::R).is_empty())
     }
     /// The page pointered by page table entry is writable?
     pub fn writable(&self) -> bool {
-        (self.flags() & PTEFlags::W) != PTEFlags::empty()
+        !((self.flags() & PTEFlags::W).is_empty())
     }
     /// The page pointered by page table entry is executable?
     pub fn executable(&self) -> bool {
-        (self.flags() & PTEFlags::X) != PTEFlags::empty()
+        !((self.flags() & PTEFlags::X).is_empty())
     }
 }
 
