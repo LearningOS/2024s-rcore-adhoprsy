@@ -14,8 +14,11 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, VPNRange, VirtAddr};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_ms;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -79,6 +82,7 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let next_task = &mut inner.tasks[0];
         next_task.task_status = TaskStatus::Running;
+        next_task.first_run_time = get_time_ms();
         let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
         drop(inner);
         let mut _unused = TaskContext::zero_init();
@@ -140,6 +144,9 @@ impl TaskManager {
             let mut inner = self.inner.exclusive_access();
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
+            if inner.tasks[next].first_run_time == 0 {
+                inner.tasks[next].first_run_time = get_time_ms();
+            }
             inner.current_task = next;
             let current_task_cx_ptr = &mut inner.tasks[current].task_cx as *mut TaskContext;
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
@@ -152,6 +159,70 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    fn first_run_time(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].first_run_time
+    }
+
+    fn inc_syscall_num(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_num[syscall_id] += 1;
+    }
+
+    fn get_syscall_num(&self) -> [u32; MAX_SYSCALL_NUM] {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_num
+    }
+
+    fn map_memory(&self, start: usize, len: usize, prot: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let task = &mut inner.tasks[current];
+        let mem = &mut task.memory_set;
+
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let vpn_range = VPNRange::new(start_va.into(), end_va.ceil());
+        for vpn in vpn_range {
+            //check if alloced
+            if let Some(pte) = mem.translate(vpn) {
+                if pte.is_valid() {
+                    error!("mmaping a mapped page");
+                    return -1;
+                }
+            }
+        }
+        let perm = MapPermission::from_bits((prot as u8) << 1).unwrap() | MapPermission::U;
+        mem.insert_framed_area(start_va, end_va, perm);
+        0
+    }
+
+    fn unmap_memory(&self, start: usize, len: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let task = &mut inner.tasks[current];
+        let mem = &mut task.memory_set;
+
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let vpn_range = VPNRange::new(start_va.into(), end_va.ceil());
+        for vpn in vpn_range {
+            //check if alloced
+            if let Some(pte) = mem.translate(vpn) {
+                if !pte.is_valid() {
+                    error!("unmaping a invalid page");
+                    return -1;
+                }
+            }
+        }
+        mem.remove_framed_area(start_va, end_va);
+
+        0
     }
 }
 
@@ -201,4 +272,27 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// mmap
+pub fn map_memory(start: usize, len: usize, prot: usize) -> isize {
+    TASK_MANAGER.map_memory(start, len, prot)
+}
+
+/// unmap
+pub fn unmap_memory(start: usize, len: usize) -> isize {
+    TASK_MANAGER.unmap_memory(start, len)
+}
+
+/// get first scheduled time
+pub fn get_first_run_time() -> usize {
+    TASK_MANAGER.first_run_time()
+}
+/// update syscall counter
+pub fn update_syscall_counter(syscall_id: usize) {
+    TASK_MANAGER.inc_syscall_num(syscall_id);
+}
+/// query syscall counter
+pub fn query_syscall_counter() -> [u32; MAX_SYSCALL_NUM] {
+    TASK_MANAGER.get_syscall_num()
 }

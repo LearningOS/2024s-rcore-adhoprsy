@@ -70,6 +70,18 @@ impl MemorySet {
         }
         self.areas.push(map_area);
     }
+
+    /// remove inserted
+    pub fn remove_framed_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) {
+        if let Some(idx) = self.areas.iter().position(|area| {
+            area.vpn_range.get_end() == end_va.into()
+                && area.vpn_range.get_start() == start_va.into()
+        }) {
+            self.areas[idx].unmap(&mut self.page_table);
+            self.areas.swap_remove(idx);
+        }
+    }
+
     /// Mention that trampoline is not collected by areas.
     fn map_trampoline(&mut self) {
         self.page_table.map(
@@ -299,7 +311,7 @@ impl MapArea {
                 self.data_frames.insert(vpn, frame);
             }
         }
-        let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
+        let pte_flags = PTEFlags::from_bits(self.map_perm.bits()).unwrap();
         page_table.map(vpn, ppn, pte_flags);
     }
     #[allow(unused)]
