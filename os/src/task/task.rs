@@ -1,9 +1,9 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{MapPermission, MemorySet, PhysPageNum, VPNRange, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
@@ -71,6 +71,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Time of first running
+    pub first_run_time: usize,
+
+    /// syscall number counter
+    pub syscall_num: [u32; MAX_SYSCALL_NUM],
 }
 
 impl TaskControlBlockInner {
@@ -135,6 +141,8 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    first_run_time: 0,
+                    syscall_num: [0; MAX_SYSCALL_NUM],
                 })
             },
         };
@@ -165,6 +173,11 @@ impl TaskControlBlock {
         inner.memory_set = memory_set;
         // update trap_cx ppn
         inner.trap_cx_ppn = trap_cx_ppn;
+        // initialize base_size
+        inner.base_size = user_sp;
+        // initialize taskinfo
+        inner.first_run_time = 0;
+        inner.syscall_num = [0; MAX_SYSCALL_NUM];
         // initialize trap_cx
         let trap_cx = TrapContext::app_init_context(
             entry_point,
@@ -216,6 +229,8 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    first_run_time: parent_inner.first_run_time,
+                    syscall_num: parent_inner.syscall_num,
                 })
             },
         });
@@ -260,6 +275,65 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// first run time
+    pub fn first_run_time(&self) -> usize {
+        self.inner_exclusive_access().first_run_time
+    }
+
+    /// increase syscall counter
+    pub fn inc_syscall_num(&self, syscall_id: usize) {
+        self.inner_exclusive_access().syscall_num[syscall_id] += 1
+    }
+
+    /// query syscall number
+    pub fn get_syscall_num(&self) -> [u32; MAX_SYSCALL_NUM] {
+        self.inner.exclusive_access().syscall_num
+    }
+
+    /// mmap
+    pub fn map_memory(&self, start: usize, len: usize, prot: usize) -> isize {
+        let mut task = self.inner_exclusive_access();
+        let mem = &mut task.memory_set;
+
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let vpn_range = VPNRange::new(start_va.into(), end_va.ceil());
+        for vpn in vpn_range {
+            //check if alloced
+            if let Some(pte) = mem.translate(vpn) {
+                if pte.is_valid() {
+                    error!("mmaping a mapped page");
+                    return -1;
+                }
+            }
+        }
+        let perm = MapPermission::from_bits((prot as u8) << 1).unwrap() | MapPermission::U;
+        mem.insert_framed_area(start_va, end_va, perm);
+        0
+    }
+
+    /// munmap
+    pub fn unmap_memory(&self, start: usize, len: usize) -> isize {
+        let mut task = self.inner_exclusive_access();
+        let mem = &mut task.memory_set;
+
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let vpn_range = VPNRange::new(start_va.into(), end_va.ceil());
+        for vpn in vpn_range {
+            //check if alloced
+            if let Some(pte) = mem.translate(vpn) {
+                if !pte.is_valid() {
+                    error!("unmaping a invalid page");
+                    return -1;
+                }
+            }
+        }
+        mem.remove_area_with_start_va(start_va);
+
+        0
     }
 }
 
