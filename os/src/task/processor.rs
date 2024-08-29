@@ -66,6 +66,7 @@ pub fn run_tasks() {
             if task_inner.first_run_time == 0 {
                 task_inner.first_run_time = get_time_ms();
             }
+            task_inner.update_stride();
             // release coming task_inner manually
             drop(task_inner);
             // release coming task TCB manually
@@ -126,6 +127,11 @@ pub fn map_memory(start: usize, len: usize, prot: usize) -> isize {
 /// unmap
 pub fn unmap_memory(start: usize, len: usize) -> isize {
     current_task().unwrap().unmap_memory(start, len)
+}
+
+/// set prio
+pub fn current_set_priority(prio: isize) -> isize {
+    current_task().unwrap().set_priority(prio)
 }
 
 ///Return to idle control flow for new scheduling
