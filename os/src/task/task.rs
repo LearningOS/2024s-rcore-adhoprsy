@@ -10,6 +10,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
+use core::cmp::Ordering;
 
 /// Task control block structure
 ///
@@ -77,6 +78,11 @@ pub struct TaskControlBlockInner {
 
     /// syscall number counter
     pub syscall_num: [u32; MAX_SYSCALL_NUM],
+
+    /// stride
+    pub stride: Stride,
+    /// stride priority
+    pub priority: u32,
 }
 
 impl TaskControlBlockInner {
@@ -99,6 +105,10 @@ impl TaskControlBlockInner {
             self.fd_table.push(None);
             self.fd_table.len() - 1
         }
+    }
+
+    pub fn update_stride(&mut self) {
+        self.stride.0 += BIG_STRIDE / self.priority;
     }
 }
 
@@ -143,6 +153,8 @@ impl TaskControlBlock {
                     program_brk: user_sp,
                     first_run_time: 0,
                     syscall_num: [0; MAX_SYSCALL_NUM],
+                    stride: Stride(0),
+                    priority: 16,
                 })
             },
         };
@@ -219,6 +231,8 @@ impl TaskControlBlock {
                     program_brk: user_sp,
                     first_run_time: 0,
                     syscall_num: [0; MAX_SYSCALL_NUM],
+                    stride: Stride(0),
+                    priority: 16,
                 })
             },
         });
@@ -278,6 +292,8 @@ impl TaskControlBlock {
                     program_brk: parent_inner.program_brk,
                     first_run_time: parent_inner.first_run_time,
                     syscall_num: parent_inner.syscall_num,
+                    stride: Stride(0),
+                    priority: 16,
                 })
             },
         });
@@ -382,6 +398,17 @@ impl TaskControlBlock {
 
         0
     }
+
+    /// set priority
+    pub fn set_priority(&self, prio: isize) -> isize {
+        self.inner_exclusive_access().priority = prio as u32;
+        prio
+    }
+
+    /// update stride
+    pub fn update_stride(&self) {
+        self.inner_exclusive_access().update_stride();
+    }
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -395,4 +422,47 @@ pub enum TaskStatus {
     Running,
     /// exited
     Zombie,
+}
+
+#[derive(Clone, Copy)]
+/// stride schedule
+pub struct Stride(pub u32);
+
+const BIG_STRIDE: u32 = u32::MAX;
+
+impl PartialEq for Stride {
+    fn eq(&self, _other: &Self) -> bool {
+        // false
+        // self.0 == other.0
+        todo!()
+    }
+}
+
+impl Eq for Stride {}
+
+impl PartialOrd for Stride {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let a = self.0;
+        let b = other.0;
+        let dis = if a > b { a - b } else { b - a };
+        if dis > BIG_STRIDE / 2 {
+            return if a > b {
+                Some(Ordering::Less)
+            } else {
+                Some(Ordering::Greater)
+            };
+        } else {
+            return if a > b {
+                Some(Ordering::Greater)
+            } else {
+                Some(Ordering::Less)
+            };
+        }
+    }
+}
+
+impl Ord for Stride {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap()
+    }
 }
