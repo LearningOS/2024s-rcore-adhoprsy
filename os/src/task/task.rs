@@ -1,15 +1,16 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{MAX_SYSCALL_NUM, TRAP_CONTEXT_BASE};
 use crate::fs::{File, Stdin, Stdout};
-use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
+use crate::mm::{MapPermission, MemorySet, PhysPageNum, VPNRange, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
+use core::cmp::Ordering;
 
 /// Task control block structure
 ///
@@ -71,6 +72,17 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Time of first running
+    pub first_run_time: usize,
+
+    /// syscall number counter
+    pub syscall_num: [u32; MAX_SYSCALL_NUM],
+
+    /// stride
+    pub stride: Stride,
+    /// stride priority
+    pub priority: u32,
 }
 
 impl TaskControlBlockInner {
@@ -93,6 +105,10 @@ impl TaskControlBlockInner {
             self.fd_table.push(None);
             self.fd_table.len() - 1
         }
+    }
+
+    pub fn update_stride(&mut self) {
+        self.stride.0 += BIG_STRIDE / self.priority;
     }
 }
 
@@ -135,6 +151,10 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    first_run_time: 0,
+                    syscall_num: [0; MAX_SYSCALL_NUM],
+                    stride: Stride(0),
+                    priority: 16,
                 })
             },
         };
@@ -165,6 +185,11 @@ impl TaskControlBlock {
         inner.memory_set = memory_set;
         // update trap_cx ppn
         inner.trap_cx_ppn = trap_cx_ppn;
+        // initialize base_size
+        inner.base_size = user_sp;
+        // initialize taskinfo
+        inner.first_run_time = 0;
+        inner.syscall_num = [0; MAX_SYSCALL_NUM];
         // initialize trap_cx
         let trap_cx = TrapContext::app_init_context(
             entry_point,
@@ -175,6 +200,55 @@ impl TaskControlBlock {
         );
         *inner.get_trap_cx() = trap_cx;
         // **** release current PCB
+    }
+
+    /// spawn a new child process to run a new program, no address space copy
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        // push a task context which goes to trap_return to the top of kernel stack
+        let task_control_block = Arc::new(Self {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    first_run_time: 0,
+                    syscall_num: [0; MAX_SYSCALL_NUM],
+                    stride: Stride(0),
+                    priority: 16,
+                })
+            },
+        });
+
+        let mut parent_inner = self.inner_exclusive_access();
+        parent_inner.children.push(task_control_block.clone());
+        // prepare TrapContext in user space
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        task_control_block
     }
 
     /// parent process fork the child process
@@ -216,6 +290,10 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    first_run_time: parent_inner.first_run_time,
+                    syscall_num: parent_inner.syscall_num,
+                    stride: Stride(0),
+                    priority: 16,
                 })
             },
         });
@@ -261,6 +339,76 @@ impl TaskControlBlock {
             None
         }
     }
+
+    /// first run time
+    pub fn first_run_time(&self) -> usize {
+        self.inner_exclusive_access().first_run_time
+    }
+
+    /// increase syscall counter
+    pub fn inc_syscall_num(&self, syscall_id: usize) {
+        self.inner_exclusive_access().syscall_num[syscall_id] += 1
+    }
+
+    /// query syscall number
+    pub fn get_syscall_num(&self) -> [u32; MAX_SYSCALL_NUM] {
+        self.inner.exclusive_access().syscall_num
+    }
+
+    /// mmap
+    pub fn map_memory(&self, start: usize, len: usize, prot: usize) -> isize {
+        let mut task = self.inner_exclusive_access();
+        let mem = &mut task.memory_set;
+
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let vpn_range = VPNRange::new(start_va.into(), end_va.ceil());
+        for vpn in vpn_range {
+            //check if alloced
+            if let Some(pte) = mem.translate(vpn) {
+                if pte.is_valid() {
+                    error!("mmaping a mapped page");
+                    return -1;
+                }
+            }
+        }
+        let perm = MapPermission::from_bits((prot as u8) << 1).unwrap() | MapPermission::U;
+        mem.insert_framed_area(start_va, end_va, perm);
+        0
+    }
+
+    /// munmap
+    pub fn unmap_memory(&self, start: usize, len: usize) -> isize {
+        let mut task = self.inner_exclusive_access();
+        let mem = &mut task.memory_set;
+
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(start + len);
+        let vpn_range = VPNRange::new(start_va.into(), end_va.ceil());
+        for vpn in vpn_range {
+            //check if alloced
+            if let Some(pte) = mem.translate(vpn) {
+                if !pte.is_valid() {
+                    error!("unmaping a invalid page");
+                    return -1;
+                }
+            }
+        }
+        mem.remove_area_with_start_va(start_va);
+
+        0
+    }
+
+    /// set priority
+    pub fn set_priority(&self, prio: isize) -> isize {
+        self.inner_exclusive_access().priority = prio as u32;
+        prio
+    }
+
+    /// update stride
+    pub fn update_stride(&self) {
+        self.inner_exclusive_access().update_stride();
+    }
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -274,4 +422,47 @@ pub enum TaskStatus {
     Running,
     /// exited
     Zombie,
+}
+
+#[derive(Clone, Copy)]
+/// stride schedule
+pub struct Stride(pub u32);
+
+const BIG_STRIDE: u32 = u32::MAX;
+
+impl PartialEq for Stride {
+    fn eq(&self, _other: &Self) -> bool {
+        // false
+        // self.0 == other.0
+        todo!()
+    }
+}
+
+impl Eq for Stride {}
+
+impl PartialOrd for Stride {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let a = self.0;
+        let b = other.0;
+        let dis = if a > b { a - b } else { b - a };
+        if dis > BIG_STRIDE / 2 {
+            return if a > b {
+                Some(Ordering::Less)
+            } else {
+                Some(Ordering::Greater)
+            };
+        } else {
+            return if a > b {
+                Some(Ordering::Greater)
+            } else {
+                Some(Ordering::Less)
+            };
+        }
+    }
+}
+
+impl Ord for Stride {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap()
+    }
 }

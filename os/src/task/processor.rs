@@ -7,7 +7,9 @@
 use super::__switch;
 use super::{fetch_task, TaskStatus};
 use super::{TaskContext, TaskControlBlock};
+use crate::config::MAX_SYSCALL_NUM;
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_ms;
 use crate::trap::TrapContext;
 use alloc::sync::Arc;
 use lazy_static::*;
@@ -61,6 +63,10 @@ pub fn run_tasks() {
             let mut task_inner = task.inner_exclusive_access();
             let next_task_cx_ptr = &task_inner.task_cx as *const TaskContext;
             task_inner.task_status = TaskStatus::Running;
+            if task_inner.first_run_time == 0 {
+                task_inner.first_run_time = get_time_ms();
+            }
+            task_inner.update_stride();
             // release coming task_inner manually
             drop(task_inner);
             // release coming task TCB manually
@@ -98,6 +104,34 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
         .unwrap()
         .inner_exclusive_access()
         .get_trap_cx()
+}
+
+/// first run time
+pub fn get_first_run_time() -> usize {
+    current_task().unwrap().first_run_time()
+}
+/// update syscall counter
+pub fn update_syscall_counter(syscall_id: usize) {
+    current_task().unwrap().inc_syscall_num(syscall_id);
+}
+/// query syscall counter
+pub fn query_syscall_counter() -> [u32; MAX_SYSCALL_NUM] {
+    current_task().unwrap().get_syscall_num()
+}
+
+/// mmap
+pub fn map_memory(start: usize, len: usize, prot: usize) -> isize {
+    current_task().unwrap().map_memory(start, len, prot)
+}
+
+/// unmap
+pub fn unmap_memory(start: usize, len: usize) -> isize {
+    current_task().unwrap().unmap_memory(start, len)
+}
+
+/// set prio
+pub fn current_set_priority(prio: isize) -> isize {
+    current_task().unwrap().set_priority(prio)
 }
 
 ///Return to idle control flow for new scheduling

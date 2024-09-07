@@ -66,6 +66,20 @@ impl MemorySet {
             None,
         );
     }
+
+    /// remove inserted
+    pub fn remove_area_with_start_va(&mut self, start_va: VirtAddr) {
+        if let Some((idx, area)) = self
+            .areas
+            .iter_mut()
+            .enumerate()
+            .find(|(_, area)| area.vpn_range.get_start() == start_va.into())
+        {
+            area.unmap(&mut self.page_table);
+            self.areas.swap_remove(idx);
+        }
+    }
+
     /// remove a area
     pub fn remove_area_with_start_vpn(&mut self, start_vpn: VirtPageNum) {
         if let Some((idx, area)) = self
@@ -363,7 +377,7 @@ impl MapArea {
                 self.data_frames.insert(vpn, frame);
             }
         }
-        let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();
+        let pte_flags = PTEFlags::from_bits(self.map_perm.bits()).unwrap();
         page_table.map(vpn, ppn, pte_flags);
     }
     pub fn unmap_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -428,6 +442,7 @@ pub enum MapType {
 }
 
 bitflags! {
+    #[derive(Clone, Copy)]
     /// map permission corresponding to that in pte: `R W X U`
     pub struct MapPermission: u8 {
         ///Readable
